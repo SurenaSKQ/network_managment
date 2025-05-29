@@ -95,6 +95,7 @@ def test_connectivity(net):
         info(f"Switch: {flow['deviceId']}, "
              f"Selector: {flow['selector']['criteria']}, "
              f"Action: {flow['treatment']['instructions']}\n")
+
 def launch_ddos_attack(net, attacker, target_ip):
     """Simulate UDP flood attack from attacker host to target IP"""
     attacker_host = net.get(attacker)
@@ -148,6 +149,26 @@ def verify_attack_impact(net, src, dst, duration=10):
     info("*** ATTACK TRAFFIC RESULTS:\n")
     info(server.cmd('cat server.log') + '\n')
 
+def ping_test(net, src, dst, count=3):
+    """Perform ping test between hosts"""
+    src_host = net.get(src)
+    dst_ip = net.get(dst).IP()
+    result = src_host.cmd(f'ping -c {count} {dst_ip}')
+    info(f"*** PING TEST {src} -> {dst}:\n{result}\n")
+
+def check_controller_connection():
+    """Verify ONOS is reachable and switches connected"""
+    devices_url = f'http://{ONOS_IP}:8181/onos/v1/devices'
+    try:
+        response = requests.get(devices_url, auth=(ONOS_USER, ONOS_PASS))
+        info(f"*** Controller status: {response.status_code}\n")
+        if response.status_code == 200:
+            devices = response.json()['devices']
+            for d in devices:
+                info(f"Connected: {d['id']} ({d['available']})\n")
+    except Exception as e:
+        info(f"Controller connection failed: {str(e)}\n")
+
 def main():
     setLogLevel('info')
     net = create_network()
@@ -156,13 +177,17 @@ def main():
         net.start()
         info("*** Network started. Waiting for controller connection...\n")
         time.sleep(10)  # Allow controller-switch handshake
-        
+        check_controller_connection()
+
         # Install demonstration flows
         install_flows('of:0000000000000001', '10.0.0.1/32', '10.0.0.2/32', 2)  # h1->h2 via s1-s2
         install_flows('of:0000000000000002', '10.0.0.2/32', '10.0.0.1/32', 1)  # h2->h1 via s2-s1
         
         # Test routing
         test_connectivity(net)
+
+        ATTACKER = 'h3'
+        TARGET = 'h1'
         try:
             # 1. Start DDoS attack
             launch_ddos_attack(net, ATTACKER, net.get(TARGET).IP())
