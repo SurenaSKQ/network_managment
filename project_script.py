@@ -12,11 +12,19 @@ from mininet.log import setLogLevel, info
 import requests
 import time
 
+# SECTION: Constants
+
 # ONOS credentials and API endpoint
 ONOS_IP = '127.0.0.1'
 ONOS_USER = 'onos'
 ONOS_PASS = 'rocks'
 FLOW_API = f'http://{ONOS_IP}:8181/onos/v1/flows'
+# Switch IDs
+SWITCH1_DPID = 'of:0000000000000001'
+SWITCH2_DPID = 'of:0000000000000002'
+
+
+# SECTION: Fundamental functions
 
 def create_network():
     """Create SDN topology with OpenFlow switches and hosts"""
@@ -48,6 +56,9 @@ def create_network():
 
 def install_flows(switch_id, src_ip, dst_ip, out_port):
     """Install proactive flow rules via ONOS REST API"""
+
+    url = f'{FLOW_API}/{switch_id}'
+
     flow = {
         "priority": 40000,
         "timeout": 0,
@@ -68,7 +79,7 @@ def install_flows(switch_id, src_ip, dst_ip, out_port):
     }
     
     response = requests.post(
-        FLOW_API,
+        url,
         json=flow,
         auth=(ONOS_USER, ONOS_PASS),
         headers={'Content-Type': 'application/json'}
@@ -78,6 +89,32 @@ def install_flows(switch_id, src_ip, dst_ip, out_port):
         info(f'Flow installed on {switch_id} for {src_ip}->{dst_ip}\n')
     else:
         info(f'Error installing flow: {response.text}\n')
+
+def install_arp_flows(device_id):
+    """Install ARP handling flow on specific device"""
+    url = f"{FLOW_API}/{device_id}"
+    
+    arp_flow = {
+        "priority": 41000,
+        "timeout": 0,
+        "isPermanent": True,
+        "treatment": {"instructions": [{"type": "OUTPUT", "port": "CONTROLLER"}]},
+        "selector": {"criteria": [{"type": "ETH_TYPE", "ethType": "0x0806"}]}  # ARP
+    }
+    
+    response = requests.post(
+        url,
+        json=arp_flow,
+        auth=(ONOS_USER, ONOS_PASS),
+        headers={'Content-Type': 'application/json'}
+    )
+    
+    if response.status_code in (200, 201):
+        info(f'ARP flow installed on {device_id}\n')
+    else:
+        info(f'Failed to install ARP flow on {device_id}: {response.text}\n')
+
+# SECTION: Testing utilities
 
 def test_connectivity(net):
     """Test routing between hosts"""
@@ -96,6 +133,28 @@ def test_connectivity(net):
              f"Selector: {flow['selector']['criteria']}, "
              f"Action: {flow['treatment']['instructions']}\n")
 
+def ping_test(net, src, dst, count=3):
+    """Perform ping test between hosts"""
+    src_host = net.get(src)
+    dst_ip = net.get(dst).IP()
+    result = src_host.cmd(f'ping -c {count} {dst_ip}')
+    info(f"*** PING TEST {src} -> {dst}:\n{result}\n")
+
+def check_controller_connection():
+    """Verify ONOS is reachable and switches connected"""
+    devices_url = f'http://{ONOS_IP}:8181/onos/v1/devices'
+    try:
+        response = requests.get(devices_url, auth=(ONOS_USER, ONOS_PASS))
+        info(f"*** Controller status: {response.status_code}\n")
+        if response.status_code == 200:
+            devices = response.json()['devices']
+            for d in devices:
+                info(f"Connected: {d['id']} ({d['available']})\n")
+    except Exception as e:
+        info(f"Controller connection failed: {str(e)}\n")
+
+
+# SECTION: DDOS utilities
 def launch_ddos_attack(net, attacker, target_ip):
     """Simulate UDP flood attack from attacker host to target IP"""
     attacker_host = net.get(attacker)
@@ -103,9 +162,9 @@ def launch_ddos_attack(net, attacker, target_ip):
     attacker_host.cmd(f'hping3 --flood --udp -p 80 {target_ip} &')
     info(f"*** DDoS ATTACK STARTED: {attacker} flooding {target_ip}\n")
 
-def mitigate_ddos(attacker_ip):
+def mitigate_ddos(switch_id, attacker_ip):
     """Install blocking flows against attacker IP on all switches"""
-    switches = ['of:0000000000000001', 'of:0000000000000002']  # Update with your DPIDs
+    switches = [SWITCH1_DPID, SWITCH2_DPID]
     
     for switch in switches:
         block_flow = {
@@ -122,7 +181,7 @@ def mitigate_ddos(attacker_ip):
             }
         }
         response = requests.post(
-            FLOW_API,
+            f'{FLOW_API}/{switch_id}',
             json=block_flow,
             auth=(ONOS_USER, ONOS_PASS),
             headers={'Content-Type': 'application/json'}
@@ -149,45 +208,32 @@ def verify_attack_impact(net, src, dst, duration=10):
     info("*** ATTACK TRAFFIC RESULTS:\n")
     info(server.cmd('cat server.log') + '\n')
 
-def ping_test(net, src, dst, count=3):
-    """Perform ping test between hosts"""
-    src_host = net.get(src)
-    dst_ip = net.get(dst).IP()
-    result = src_host.cmd(f'ping -c {count} {dst_ip}')
-    info(f"*** PING TEST {src} -> {dst}:\n{result}\n")
-
-def check_controller_connection():
-    """Verify ONOS is reachable and switches connected"""
-    devices_url = f'http://{ONOS_IP}:8181/onos/v1/devices'
-    try:
-        response = requests.get(devices_url, auth=(ONOS_USER, ONOS_PASS))
-        info(f"*** Controller status: {response.status_code}\n")
-        if response.status_code == 200:
-            devices = response.json()['devices']
-            for d in devices:
-                info(f"Connected: {d['id']} ({d['available']})\n")
-    except Exception as e:
-        info(f"Controller connection failed: {str(e)}\n")
-
 def main():
     setLogLevel('info')
     net = create_network()
-    
+
     try:
         net.start()
         info("*** Network started. Waiting for controller connection...\n")
         time.sleep(10)  # Allow controller-switch handshake
         check_controller_connection()
 
+        install_arp_flows(SWITCH1_DPID)
+        install_arp_flows(SWITCH2_DPID)
+
         # Install demonstration flows
-        install_flows('of:0000000000000001', '10.0.0.1/32', '10.0.0.2/32', 2)  # h1->h2 via s1-s2
-        install_flows('of:0000000000000002', '10.0.0.2/32', '10.0.0.1/32', 1)  # h2->h1 via s2-s1
+        install_flows(SWITCH1_DPID, '10.0.0.1/32', '10.0.0.2/32', 2)  # h1->h2 via s1-s2
+        install_flows(SWITCH2_DPID, '10.0.0.2/32', '10.0.0.1/32', 1)  # h2->h1 via s2-s1
         
         # Test routing
+        ping_test(net, 'h1', 'h2')
+        ping_test(net, 'h1', 'h3')
         test_connectivity(net)
 
         ATTACKER = 'h3'
         TARGET = 'h1'
+        ATTACKER_IP = '10.0.0.3'
+        
         try:
             # 1. Start DDoS attack
             launch_ddos_attack(net, ATTACKER, net.get(TARGET).IP())
@@ -196,7 +242,7 @@ def main():
             verify_attack_impact(net, 'h2', TARGET)  # Test h2->h1 during attack
             
             # 3. Mitigate attack
-            mitigate_ddos('10.0.0.3')  # Block attacker IP
+            mitigate_ddos(SWITCH2_DPID, ATTACKER_IP)  # Block attacker IP
             time.sleep(3)  # Allow flow installation
             
             # 4. Verify mitigation
