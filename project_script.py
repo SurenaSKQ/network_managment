@@ -162,10 +162,8 @@ def launch_ddos_attack(net, attacker, target_ip):
     attacker_host.cmd(f'hping3 --flood --udp -p 80 {target_ip} &')
     info(f"*** DDoS ATTACK STARTED: {attacker} flooding {target_ip}\n")
 
-def mitigate_ddos(switch_id, attacker_ip):
+def mitigate_ddos(switches, attacker_ip):
     """Install blocking flows against attacker IP on all switches"""
-    switches = [SWITCH1_DPID, SWITCH2_DPID]
-    
     for switch in switches:
         block_flow = {
             "priority": 50000,  # Higher than normal flows
@@ -228,11 +226,14 @@ def main():
         # Test routing
         ping_test(net, 'h1', 'h2')
         ping_test(net, 'h1', 'h3')
+
+        time.sleep(12) # Wait for controller
+
         test_connectivity(net)
 
         ATTACKER = 'h3'
         TARGET = 'h1'
-        ATTACKER_IP = '10.0.0.3'
+        ATTACKER_IP = '10.0.0.3/32'
         
         try:
             # 1. Start DDoS attack
@@ -242,7 +243,7 @@ def main():
             verify_attack_impact(net, 'h2', TARGET)  # Test h2->h1 during attack
             
             # 3. Mitigate attack
-            mitigate_ddos(SWITCH2_DPID, ATTACKER_IP)  # Block attacker IP
+            mitigate_ddos([SWITCH2_DPID], ATTACKER_IP)  # Block attacker IP
             time.sleep(3)  # Allow flow installation
             
             # 4. Verify mitigation
