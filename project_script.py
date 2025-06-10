@@ -38,8 +38,8 @@ def create_network():
                       protocols='OpenFlow13')
     
     # Create switches
-    s1 = net.addSwitch('s1', protocols='OpenFlow13')
-    s2 = net.addSwitch('s2', protocols='OpenFlow13')
+    s1 = net.addSwitch('s1', dpid="0000000000000001",protocols='OpenFlow13')
+    s2 = net.addSwitch('s2', dpid="0000000000000002", protocols='OpenFlow13')
     
     # Create hosts with IP addresses
     h1 = net.addHost('h1', ip='10.0.0.1/24')
@@ -114,17 +114,33 @@ def install_arp_flows(device_id):
     else:
         info(f'Failed to install ARP flow on {device_id}: {response.text}\n')
 
+def install_table_miss_flow(device_id):
+    url = f"{FLOW_API}/{device_id}"
+    flow = {
+        "priority": 0,
+        "timeout": 0,
+        "isPermanent": True,
+        "deviceId": device_id,
+        "treatment": {"instructions": [{"type": "OUTPUT", "port": "CONTROLLER"}]},
+        "selector": {}
+    }
+    response = requests.post(
+        url,
+        json=flow,
+        auth=(ONOS_USER, ONOS_PASS),
+        headers={'Content-Type': 'application/json'}
+    )
+    if response.status_code in (200, 201):
+        info(f'Table-miss flow installed on {device_id}\n')
+    else:
+        info(f'Failed to install table-miss flow: {response.text}\n')
+
 # SECTION: Testing utilities
 
 def test_connectivity(net):
     """Test routing between hosts"""
     info("*** Testing basic connectivity\n")
-    h1, h2 = net.get('h1'), net.get('h2')
-    
-    # Ping test with 5 packets
-    result = h1.cmd('ping -c 5', h2.IP())
-    info(result)
-    
+    net.pingAll()
     # Show installed flows
     info("\n*** Displaying active flows in ONOS\n")
     flows = requests.get(FLOW_API, auth=(ONOS_USER, ONOS_PASS)).json()
@@ -155,6 +171,7 @@ def check_controller_connection():
 
 
 # SECTION: DDOS utilities
+
 def launch_ddos_attack(net, attacker, target_ip):
     """Simulate UDP flood attack from attacker host to target IP"""
     attacker_host = net.get(attacker)
@@ -179,7 +196,7 @@ def mitigate_ddos(switches, attacker_ip):
             }
         }
         response = requests.post(
-            f'{FLOW_API}/{switch_id}',
+            f'{FLOW_API}/{switch}',
             json=block_flow,
             auth=(ONOS_USER, ONOS_PASS),
             headers={'Content-Type': 'application/json'}
@@ -216,13 +233,27 @@ def main():
         time.sleep(10)  # Allow controller-switch handshake
         check_controller_connection()
 
+        install_table_miss_flow(SWITCH1_DPID)
+        install_table_miss_flow(SWITCH2_DPID)
+
         install_arp_flows(SWITCH1_DPID)
         install_arp_flows(SWITCH2_DPID)
 
         # Install demonstration flows
-        install_flows(SWITCH1_DPID, '10.0.0.1/32', '10.0.0.2/32', 2)  # h1->h2 via s1-s2
-        install_flows(SWITCH2_DPID, '10.0.0.2/32', '10.0.0.1/32', 1)  # h2->h1 via s2-s1
-        
+        # s1 Flows
+        install_flows(SWITCH1_DPID, '10.0.0.1/32', '10.0.0.2/32', 1)  # h1->h2 via s1-s2 (port1)
+        install_flows(SWITCH1_DPID, '10.0.0.1/32', '10.0.0.3/32', 1)  # h1->h3 via s1-s2 (port1)
+        install_flows(SWITCH1_DPID, '10.0.0.2/32', '10.0.0.1/32', 2)  # h2->h1 via s1-h1 (port2) 🆕 REVERSE PATH
+        install_flows(SWITCH1_DPID, '10.0.0.3/32', '10.0.0.1/32', 2)  # h3->h1 via s1-h1 (port2) 🆕 REVERSE PATH
+
+        # s2 Flows
+        install_flows(SWITCH2_DPID, '10.0.0.2/32', '10.0.0.1/32', 1)  # h2->h1 via s2-s1 (port1) ✅ FIXED PORT
+        install_flows(SWITCH2_DPID, '10.0.0.3/32', '10.0.0.1/32', 1)  # h3->h1 via s2-s1 (port1) ✅ FIXED PORT
+        install_flows(SWITCH2_DPID, '10.0.0.3/32', '10.0.0.2/32', 2)  # h3->h2 via s2-h2 (port2)
+        install_flows(SWITCH2_DPID, '10.0.0.1/32', '10.0.0.2/32', 2)  # h1->h2 via s2-h2 (port2) 🆕 FORWARD PATH
+        install_flows(SWITCH2_DPID, '10.0.0.1/32', '10.0.0.3/32', 3)  # h1->h3 via s2-h3 (port3) 🆕 FORWARD PATH 
+                
+
         # Test routing
         ping_test(net, 'h1', 'h2')
         ping_test(net, 'h1', 'h3')
