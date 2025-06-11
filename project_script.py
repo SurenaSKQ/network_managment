@@ -11,6 +11,7 @@ from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 import requests
 import time
+import re
 
 # SECTION: Constants
 
@@ -45,9 +46,15 @@ def create_network():
     h1 = net.addHost('h1', ip='10.0.0.1/24')
     h2 = net.addHost('h2', ip='10.0.0.2/24')
     h3 = net.addHost('h3', ip='10.0.0.3/24')
+
+    # Create LIMITED bandwidth link with queue management
+    net.addLink(s1, s2, 
+                bw=10, 
+                delay='1ms', 
+                max_queue_size=10,  # Small buffer for rapid congestion
+                use_htb=True)  # Hierarchical Token Bucket for accuracy
     
     # Create links
-    net.addLink(s1, s2)
     net.addLink(h1, s1)
     net.addLink(h2, s2)
     net.addLink(h3, s2)
@@ -135,6 +142,59 @@ def install_table_miss_flow(device_id):
     else:
         info(f'Failed to install table-miss flow: {response.text}\n')
 
+def install_arp_proxy_flows(switch_id, ip_prefix):
+    """Install ARP proxy flows to handle L2 resolution without controller"""
+    arp_proxy_flow = {
+        "priority": 42000,
+        "timeout": 0,
+        "isPermanent": True,
+        "treatment": {
+            "instructions": [
+                {
+                    "type": "L2MODIFICATION",
+                    "subtype": "ETH_DST",
+                    "mac": "00:00:00:00:00:FF"  # Proxy MAC
+                },
+                {"type": "OUTPUT", "port": "CONTROLLER"}
+            ]
+        },
+        "selector": {
+            "criteria": [
+                {"type": "ETH_TYPE", "ethType": "0x0806"},  # ARP
+                {"type": "IPV4_DST", "ip": f"{ip_prefix}"}  # Target subnet
+            ]
+        }
+    }
+    response = requests.post(
+        f"{FLOW_API}/{switch_id}",
+        json=arp_proxy_flow,
+        auth=(ONOS_USER, ONOS_PASS),
+        headers={'Content-Type': 'application/json'}
+    )
+    info(f'ARP proxy installed on {switch_id} for {ip_prefix}\n')
+
+def preconfigure_arp(net):
+    """Preconfigure static ARP entries to bypass resolution"""
+    info("*** Preconfiguring ARP tables\n")
+    hosts = [net.get('h1'), net.get('h2'), net.get('h3')]
+    ips = ['10.0.0.1', '10.0.0.2', '10.0.0.3']
+    macs = [h.MAC() for h in hosts]
+    
+    for i, host in enumerate(hosts):
+        for j, ip in enumerate(ips):
+            if i != j:  # Skip self
+                host.cmd(f'arp -s {ip} {macs[j]}')
+
+def get_host_port(switch, host_name):
+    """Dynamically find port number for host connection"""
+    for intf in switch.intfList():
+        link = intf.link
+        if link:
+            node1, node2 = link.intf1.node, link.intf2.node
+            if host_name in [node1.name, node2.name]:
+                return intf.node.ports[intf]
+    return None
+
 # SECTION: Testing utilities
 
 def test_connectivity(net):
@@ -173,11 +233,19 @@ def check_controller_connection():
 # SECTION: DDOS utilities
 
 def launch_ddos_attack(net, attacker, target_ip):
-    """Simulate UDP flood attack from attacker host to target IP"""
+    """Generate high-intensity traffic using kernel-level tools"""
     attacker_host = net.get(attacker)
-    # Launch persistent UDP flood in background
-    attacker_host.cmd(f'hping3 --flood --udp -p 80 {target_ip} &')
-    info(f"*** DDoS ATTACK STARTED: {attacker} flooding {target_ip}\n")
+    
+    # Kernel-level UDP flood (bypass Python limitations)
+    attacker_host.cmd(f'sudo nping --rate 1000000 --udp -p 80 -c 0 {target_ip} > /dev/null 2>&1 &')
+    
+    # TCP SYN flood with raw sockets
+    attacker_host.cmd(f'sudo hping3 --faster -S -p 80 {target_ip} > /dev/null 2>&1 &')
+    
+    # HTTP flood with high concurrency
+    attacker_host.cmd(f'siege -b -c 500 -t 300s http://{target_ip} > /dev/null 2>&1 &')
+    
+    info(f"*** CARRIER-GRADE DDoS STARTED: {attacker} ➔ {target_ip}\n")
 
 def mitigate_ddos(switches, attacker_ip):
     """Install blocking flows against attacker IP on all switches"""
@@ -206,22 +274,40 @@ def mitigate_ddos(switches, attacker_ip):
         else:
             info(f'*** MITIGATION FAILED: {response.text}\n')
 
-def verify_attack_impact(net, src, dst, duration=10):
-    """Test connectivity during attack"""
-    info("*** MEASURING ATTACK IMPACT (this will take 10 sec)\n")
+def verify_attack_impact(net, src, dst, duration=15):
+    """Measure network degradation during attack"""
     server = net.get(dst)
     client = net.get(src)
-    
-    # Start iPerf server on target
+    s1 = net.get('s1')  # Get switch object
+
+    # Start traffic monitor on BOTTLENECK LINK (s1-eth0)
+    bottleneck_intf = 's1-eth0'  # First interface = s1-s2 link
+    s1.cmd(f'tcpdump -i {bottleneck_intf} -w bottleneck.pcap &')
+
+    # Start iPerf server
     server.cmd('iperf -s -u -i 1 > server.log &')
     time.sleep(1)
-    
-    # Run iPerf client through attack
+
+    # Run bandwidth test through attack
     client.cmd(f'iperf -c {server.IP()} -u -b 100M -t {duration}')
-    
-    # Show server results
-    info("*** ATTACK TRAFFIC RESULTS:\n")
+
+    # Collect metrics
+    info("⦿ ATTACK IMPACT REPORT:\n")
     info(server.cmd('cat server.log') + '\n')
+
+    # Get queue statistics - FIXED INTERFACE NAME
+    queue_stats = s1.cmd(f'tc -s qdisc show dev {bottleneck_intf}')
+    match = re.search(r'dropped (\d+)', queue_stats)
+    packet_loss = match.group(1) if match else '0'
+    info(f"⦿ SWITCH QUEUE DROPS: {packet_loss} packets\n")
+
+    # Get ping statistics
+    ping_result = client.cmd(f'ping -c {duration} -i 0.2 {server.IP()} | grep -e "loss" -e "avg"')
+    info(f"⦿ PING STATISTICS:\n{ping_result}\n")
+
+    # Cleanup
+    s1.cmd('killall tcpdump')
+    server.cmd('killall iperf')
 
 def main():
     setLogLevel('info')
@@ -229,31 +315,73 @@ def main():
 
     try:
         net.start()
+
         info("*** Network started. Waiting for controller connection...\n")
         time.sleep(10)  # Allow controller-switch handshake
         check_controller_connection()
 
+        requests.post(
+            f'http://{ONOS_IP}:8181/onos/v1/applications/org.onosproject.fwd/deactivate',
+            auth=(ONOS_USER, ONOS_PASS)
+        )
+        info("*** DISABLED REACTIVE FORWARDING APP\n")
+        
+        # Install critical flows 
         install_table_miss_flow(SWITCH1_DPID)
         install_table_miss_flow(SWITCH2_DPID)
-
-        install_arp_flows(SWITCH1_DPID)
+        install_arp_flows(SWITCH1_DPID)  # Original ARP to controller
         install_arp_flows(SWITCH2_DPID)
+        install_arp_proxy_flows(SWITCH1_DPID, "10.0.0.0/24")  # New proxy flows
+        install_arp_proxy_flows(SWITCH2_DPID, "10.0.0.0/24")
+        
+        # Preconfigure host ARP tables
+        preconfigure_arp(net)
 
-        # Install demonstration flows
+        # Get switch objects and dynamically detect ports
+        s1 = net.get('s1')
+        s2 = net.get('s2')
+        s1_s2_port = get_host_port(s1, 's2')  # Port on s1 connected to s2
+        s1_h1_port = get_host_port(s1, 'h1')  # Port on s1 connected to h1
+        s2_s1_port = get_host_port(s2, 's1')  # Port on s2 connected to s1
+        s2_h2_port = get_host_port(s2, 'h2')  # Port on s2 connected to h2
+        s2_h3_port = get_host_port(s2, 'h3')  # Port on s2 connected to h3
+
+        # Print detected ports for debugging
+        info(f"*** Detected Port Mapping:\n"
+             f"s1-s2: port {s1_s2_port}\n"
+             f"s1-h1: port {s1_h1_port}\n"
+             f"s2-s1: port {s2_s1_port}\n"
+             f"s2-h2: port {s2_h2_port}\n"
+             f"s2-h3: port {s2_h3_port}\n")
+
+        # Install demonstration flows using DYNAMIC PORTS
         # s1 Flows
-        install_flows(SWITCH1_DPID, '10.0.0.1/32', '10.0.0.2/32', 1)  # h1->h2 via s1-s2 (port1)
-        install_flows(SWITCH1_DPID, '10.0.0.1/32', '10.0.0.3/32', 1)  # h1->h3 via s1-s2 (port1)
-        install_flows(SWITCH1_DPID, '10.0.0.2/32', '10.0.0.1/32', 2)  # h2->h1 via s1-h1 (port2) 🆕 REVERSE PATH
-        install_flows(SWITCH1_DPID, '10.0.0.3/32', '10.0.0.1/32', 2)  # h3->h1 via s1-h1 (port2) 🆕 REVERSE PATH
+        install_flows(SWITCH1_DPID, '10.0.0.1/32', '10.0.0.2/32', s1_s2_port)  # h1->h2 via s1-s2
+        install_flows(SWITCH1_DPID, '10.0.0.1/32', '10.0.0.3/32', s1_s2_port)  # h1->h3 via s1-s2
+        install_flows(SWITCH1_DPID, '10.0.0.2/32', '10.0.0.1/32', s1_h1_port)  # h2->h1 via s1-h1
+        install_flows(SWITCH1_DPID, '10.0.0.3/32', '10.0.0.1/32', s1_h1_port)  # h3->h1 via s1-h1
 
         # s2 Flows
-        install_flows(SWITCH2_DPID, '10.0.0.2/32', '10.0.0.1/32', 1)  # h2->h1 via s2-s1 (port1) ✅ FIXED PORT
-        install_flows(SWITCH2_DPID, '10.0.0.3/32', '10.0.0.1/32', 1)  # h3->h1 via s2-s1 (port1) ✅ FIXED PORT
-        install_flows(SWITCH2_DPID, '10.0.0.3/32', '10.0.0.2/32', 2)  # h3->h2 via s2-h2 (port2)
-        install_flows(SWITCH2_DPID, '10.0.0.1/32', '10.0.0.2/32', 2)  # h1->h2 via s2-h2 (port2) 🆕 FORWARD PATH
-        install_flows(SWITCH2_DPID, '10.0.0.1/32', '10.0.0.3/32', 3)  # h1->h3 via s2-h3 (port3) 🆕 FORWARD PATH 
-                
+        install_flows(SWITCH2_DPID, '10.0.0.2/32', '10.0.0.1/32', s2_s1_port)  # h2->h1 via s2-s1
+        install_flows(SWITCH2_DPID, '10.0.0.3/32', '10.0.0.1/32', s2_s1_port)  # h3->h1 via s2-s1
+        install_flows(SWITCH2_DPID, '10.0.0.3/32', '10.0.0.2/32', s2_h2_port)  # h3->h2 via s2-h2
+        install_flows(SWITCH2_DPID, '10.0.0.1/32', '10.0.0.2/32', s2_h2_port)  # h1->h2 via s2-h2
+        install_flows(SWITCH2_DPID, '10.0.0.1/32', '10.0.0.3/32', s2_h3_port)  # h1->h3 via s2-h3
+        install_flows(SWITCH2_DPID, '10.0.0.2/32', '10.0.0.3/32', s2_h3_port)  # h2->h2 via s2-h2
 
+        # After installing flows but before ping tests
+        info("*** ARP Table Diagnostics:\n")
+        for host in ['h1', 'h2', 'h3']:
+            arp_table = net.get(host).cmd('arp -n')
+            info(f"{host} ARP Cache:\n{arp_table}\n")
+       
+        info("*** Validating Port Assignments:\n")
+        for switch in [s1, s2]:
+            for intf in switch.intfList():
+                if not intf.link:
+                    continue
+                info(f"{switch.name} {intf.name} -> {intf.link.intf2.node.name}\n")
+                
         # Test routing
         ping_test(net, 'h1', 'h2')
         ping_test(net, 'h1', 'h3')
@@ -283,7 +411,7 @@ def main():
             verify_attack_impact(net, 'h2', TARGET)  # Traffic should normalize
         finally:
             # Cleanup attack processes
-            net.get(ATTACKER).cmd('killall hping3')
+            net.get(ATTACKER).cmd('killall hping3 curl > /dev/null 2>&1')
             # Start CLI for manual exploration
             info("\n*** Starting CLI for interactive commands\n")
             CLI(net)
