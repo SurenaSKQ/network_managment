@@ -367,7 +367,7 @@ def main():
         install_flows(SWITCH2_DPID, '10.0.0.3/32', '10.0.0.2/32', s2_h2_port)  # h3->h2 via s2-h2
         install_flows(SWITCH2_DPID, '10.0.0.1/32', '10.0.0.2/32', s2_h2_port)  # h1->h2 via s2-h2
         install_flows(SWITCH2_DPID, '10.0.0.1/32', '10.0.0.3/32', s2_h3_port)  # h1->h3 via s2-h3
-        install_flows(SWITCH2_DPID, '10.0.0.2/32', '10.0.0.3/32', s2_h3_port)  # h2->h2 via s2-h2
+        install_flows(SWITCH2_DPID, '10.0.0.2/32', '10.0.0.3/32', s2_h3_port)  # h2->h3 via s2-h3
 
         # After installing flows but before ping tests
         info("*** ARP Table Diagnostics:\n")
@@ -404,9 +404,10 @@ def main():
             # 3. Mitigate attack
             mitigate_ddos([SWITCH2_DPID], ATTACKER_IP)  # Block attacker IP
             time.sleep(3)  # Allow flow installation
-            
+           
             # 4. Verify mitigation
             info("*** VERIFYING MITIGATION EFFECTIVENESS\n")
+            ping_test(net, ATTACKER, TARGET) # Should be blocked
             ping_test(net, 'h2', TARGET)  # Should recover
             verify_attack_impact(net, 'h2', TARGET)  # Traffic should normalize
         finally:
